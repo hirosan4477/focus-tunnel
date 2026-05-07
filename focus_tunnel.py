@@ -14,8 +14,7 @@ def get_db():
             creds = service_account.Credentials.from_service_account_info(key_dict)
             return firestore.Client(credentials=creds, project=key_dict["project_id"])
         except Exception as e:
-            # 接続エラーをログに表示
-            print(f"Firebase Connection Error: {e}")
+            st.error(f"Firebase接続エラー: {e}")
             return None
     else:
         return None
@@ -23,9 +22,9 @@ def get_db():
 # アプリの基本設定
 st.set_page_config(page_title="Focus Tunnel (Persistence)", layout="wide")
 
-# 環境変数からApp IDを取得（Streamlit Cloud環境用）
-# ローカルテスト用にはデフォルト値を設定
-APP_ID = st.secrets.get("app_id", "focus-tunnel-unique-id")
+# アプリIDとユーザーIDの設定
+# パスルール: /artifacts/{appId}/users/{userId}/{collectionName}/{docId}
+APP_ID = "focus-tunnel-v1" 
 USER_ID = "default_user"
 
 # カスタムCSS
@@ -44,10 +43,9 @@ st.markdown("""
 db = get_db()
 
 def get_progress_doc():
-    """Firestoreのドキュメント参照を取得（ルールに従ったパス）"""
+    """Firestoreのドキュメント参照を取得"""
     if not db:
         return None
-    # 必須ルール: /artifacts/{appId}/users/{userId}/{collectionName}/{docId}
     return db.collection("artifacts").document(APP_ID).collection("users").document(USER_ID).collection("progress").document("current")
 
 def save_progress():
@@ -63,10 +61,10 @@ def save_progress():
                     "started": True
                 })
             except Exception as e:
-                print(f"Save Error: {e}")
+                print(f"Firestore Save Error: {e}")
 
 def load_progress_from_db():
-    """Firestoreから進捗を復元"""
+    """Firestoreから進捗を読み込む"""
     doc_ref = get_progress_doc()
     if doc_ref:
         try:
@@ -74,27 +72,34 @@ def load_progress_from_db():
             if doc.exists:
                 return doc.to_dict()
         except Exception as e:
-            print(f"Load Error: {e}")
+            print(f"Firestore Load Error: {e}")
     return None
 
-# セッション状態の初期化
+# セッション状態の初期化と復元
 if 'started' not in st.session_state:
-    progress = load_progress_from_db()
-    if progress and progress.get('started'):
-        st.session_state.round_count = progress.get('round_count', 1)
-        st.session_state.total_in_round = progress.get('total_in_round', 0)
-        st.session_state.current_index = progress.get('current_index', 0)
+    # 最初にDBからデータを取得
+    db_progress = load_progress_from_db()
+    
+    if db_progress and db_progress.get('started'):
+        st.session_state.round_count = db_progress.get('round_count', 1)
+        st.session_state.total_in_round = db_progress.get('total_in_round', 0)
+        st.session_state.current_index = db_progress.get('current_index', 0)
         st.session_state.started = True
     else:
         st.session_state.started = False
-        st.session_state.current_pages = []
-        st.session_state.retry_pages = []
+        st.session_state.round_count = 1
+        st.session_state.total_in_round = 0
         st.session_state.current_index = 0
+
+if 'current_pages' not in st.session_state:
+    st.session_state.current_pages = []
+if 'retry_pages' not in st.session_state:
+    st.session_state.retry_pages = []
 
 # --- メインロジック ---
 if not st.session_state.started:
     st.title("Focus Tunnel 🚀")
-    st.markdown("### 集中力を最大化する学習ツール")
+    st.markdown("### 進捗保存モード")
     
     uploaded_file = st.file_uploader("PDFをアップロードして開始", type="pdf")
     
@@ -109,7 +114,6 @@ if not st.session_state.started:
                     images.append(pix.tobytes("png"))
                 
                 st.session_state.current_pages = images
-                st.session_state.retry_pages = []
                 st.session_state.total_in_round = len(images)
                 st.session_state.round_count = 1
                 st.session_state.current_index = 0
@@ -117,37 +121,38 @@ if not st.session_state.started:
                 save_progress()
                 st.rerun()
 else:
-    # PDFデータのメモリ保持チェック
-    if not st.session_state.get('current_pages'):
-        st.warning("接続が切れました。進捗を再開するために同じPDFを再度選択してください。")
+    # メモリから画像が消えている（再起動や長時間放置）場合の処理
+    if not st.session_state.current_pages:
+        st.warning("セッションがリセットされました。進捗を再開するにはPDFを再度選択してください。")
         re_upload = st.file_uploader("同じPDFを再選択", type="pdf", key="reupload")
         if re_upload:
-            doc = fitz.open(stream=re_upload.read(), filetype="pdf")
-            images = []
-            for i in range(len(doc)):
-                page = doc.load_page(i)
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-                images.append(pix.tobytes("png"))
-            # 保存されていたインデックスから再開
-            st.session_state.current_pages = images[st.session_state.current_index:]
-            st.rerun()
+            with st.spinner("PDFを再構築中..."):
+                doc = fitz.open(stream=re_upload.read(), filetype="pdf")
+                all_images = []
+                for i in range(len(doc)):
+                    page = doc.load_page(i)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                    all_images.append(pix.tobytes("png"))
+                
+                # 保存されたインデックスから残りのページを復元
+                idx = st.session_state.current_index
+                st.session_state.current_pages = all_images[idx:]
+                st.rerun()
         
-        if st.button("進捗を消去して最初からやり直す"):
-            st.session_state.started = False
+        if st.button("進捗を破棄して最初から"):
             doc_ref = get_progress_doc()
             if doc_ref:
-                try:
-                    doc_ref.delete()
-                except:
-                    pass
+                doc_ref.delete()
+            st.session_state.clear()
             st.rerun()
         st.stop()
 
-    # 学習メイン画面
+    # 学習画面
     if len(st.session_state.current_pages) > 0:
-        current_num = st.session_state.total_in_round - len(st.session_state.current_pages) + 1
-        st.markdown(f"**ROUND {st.session_state.round_count}** | PAGE {current_num} / {st.session_state.total_in_round}")
-        st.progress(current_num / st.session_state.total_in_round)
+        # 現在表示しているページ番号を計算
+        current_display_num = st.session_state.current_index + 1
+        st.markdown(f"**ROUND {st.session_state.round_count}** | PAGE {current_display_num} / {st.session_state.total_in_round}")
+        st.progress(min(current_display_num / st.session_state.total_in_round, 1.0))
         
         image = Image.open(io.BytesIO(st.session_state.current_pages[0]))
         st.image(image, use_container_width=True)
@@ -161,20 +166,17 @@ else:
                 st.rerun()
         with col2:
             if st.button("不安 (保留)"):
-                page_data = st.session_state.current_pages.pop(0)
-                st.session_state.retry_pages.append(page_data)
+                # 保留分をメモリ内に保持（周回用）
+                st.session_state.retry_pages.append(st.session_state.current_pages.pop(0))
                 st.session_state.current_index += 1
                 save_progress()
                 st.rerun()
     else:
         st.balloons()
         st.success("この周回が終了しました！")
-        if st.button("進捗をリセットして最初から"):
-            st.session_state.started = False
+        if st.button("最初からリセット"):
             doc_ref = get_progress_doc()
             if doc_ref:
-                try:
-                    doc_ref.delete()
-                except:
-                    pass
+                doc_ref.delete()
+            st.session_state.clear()
             st.rerun()
