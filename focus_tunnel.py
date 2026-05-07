@@ -3,6 +3,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import json
+import time
 from google.oauth2 import service_account
 from google.cloud import firestore
 
@@ -49,22 +50,24 @@ def get_progress_doc():
     return db.collection("artifacts").document(APP_ID).collection("users").document(USER_ID).collection("progress").document("current")
 
 def save_progress():
-    """現在の進捗をFirestoreに保存"""
+    """現在の進捗をFirestoreに確実に保存"""
     if st.session_state.get('started'):
         doc_ref = get_progress_doc()
         if doc_ref:
             try:
-                doc_ref.set({
+                data = {
                     "round_count": st.session_state.round_count,
                     "total_in_round": st.session_state.total_in_round,
                     "current_index": st.session_state.current_index,
-                    "started": True
-                })
+                    "started": True,
+                    "timestamp": firestore.SERVER_TIMESTAMP # 保存時間を記録
+                }
+                doc_ref.set(data)
             except Exception as e:
-                print(f"Firestore Save Error: {e}")
+                st.error(f"保存に失敗しました: {e}")
 
 def load_progress_from_db():
-    """Firestoreから進捗を読み込む"""
+    """Firestoreから最新の進捗を読み込む"""
     doc_ref = get_progress_doc()
     if doc_ref:
         try:
@@ -72,34 +75,36 @@ def load_progress_from_db():
             if doc.exists:
                 return doc.to_dict()
         except Exception as e:
-            print(f"Firestore Load Error: {e}")
+            st.error(f"読み込みに失敗しました: {e}")
     return None
 
-# セッション状態の初期化と復元
-if 'started' not in st.session_state:
-    # 最初にDBからデータを取得
-    db_progress = load_progress_from_db()
-    
-    if db_progress and db_progress.get('started'):
-        st.session_state.round_count = db_progress.get('round_count', 1)
-        st.session_state.total_in_round = db_progress.get('total_in_round', 0)
-        st.session_state.current_index = db_progress.get('current_index', 0)
+# --- アプリ起動時の最優先処理 ---
+# 1. まずDBから最新の状態を取得する
+if 'db_checked' not in st.session_state:
+    db_data = load_progress_from_db()
+    if db_data and db_data.get('started'):
         st.session_state.started = True
+        st.session_state.round_count = db_data.get('round_count', 1)
+        st.session_state.total_in_round = db_data.get('total_in_round', 0)
+        st.session_state.current_index = db_data.get('current_index', 0)
     else:
         st.session_state.started = False
-        st.session_state.round_count = 1
-        st.session_state.total_in_round = 0
-        st.session_state.current_index = 0
+    st.session_state.db_checked = True
 
+# 2. 変数の初期化（DBにデータがなかった場合）
 if 'current_pages' not in st.session_state:
     st.session_state.current_pages = []
 if 'retry_pages' not in st.session_state:
     st.session_state.retry_pages = []
+if 'current_index' not in st.session_state:
+    st.session_state.current_index = 0
+if 'round_count' not in st.session_state:
+    st.session_state.round_count = 1
 
 # --- メインロジック ---
 if not st.session_state.started:
     st.title("Focus Tunnel 🚀")
-    st.markdown("### 進捗保存モード")
+    st.markdown("### 進捗保存モード (Firestore)")
     
     uploaded_file = st.file_uploader("PDFをアップロードして開始", type="pdf")
     
@@ -121,12 +126,12 @@ if not st.session_state.started:
                 save_progress()
                 st.rerun()
 else:
-    # メモリから画像が消えている（再起動や長時間放置）場合の処理
+    # 画像データが消えている場合の復元プロンプト
     if not st.session_state.current_pages:
-        st.warning("セッションがリセットされました。進捗を再開するにはPDFを再度選択してください。")
-        re_upload = st.file_uploader("同じPDFを再選択", type="pdf", key="reupload")
+        st.warning("🔄 接続がタイムアウトしました。進捗を再開するにはPDFを再度選択してください。")
+        re_upload = st.file_uploader("前回と同じPDFを選択", type="pdf", key="reupload")
         if re_upload:
-            with st.spinner("PDFを再構築中..."):
+            with st.spinner("ページを再構築中..."):
                 doc = fitz.open(stream=re_upload.read(), filetype="pdf")
                 all_images = []
                 for i in range(len(doc)):
@@ -134,12 +139,13 @@ else:
                     pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                     all_images.append(pix.tobytes("png"))
                 
-                # 保存されたインデックスから残りのページを復元
+                # 保存されているインデックス以降のページをセット
                 idx = st.session_state.current_index
                 st.session_state.current_pages = all_images[idx:]
+                st.success("復元しました！")
                 st.rerun()
         
-        if st.button("進捗を破棄して最初から"):
+        if st.button("完全にリセットして最初から"):
             doc_ref = get_progress_doc()
             if doc_ref:
                 doc_ref.delete()
@@ -147,13 +153,13 @@ else:
             st.rerun()
         st.stop()
 
-    # 学習画面
+    # 学習メイン画面
     if len(st.session_state.current_pages) > 0:
-        # 現在表示しているページ番号を計算
         current_display_num = st.session_state.current_index + 1
         st.markdown(f"**ROUND {st.session_state.round_count}** | PAGE {current_display_num} / {st.session_state.total_in_round}")
         st.progress(min(current_display_num / st.session_state.total_in_round, 1.0))
         
+        # 現在の画像を表示
         image = Image.open(io.BytesIO(st.session_state.current_pages[0]))
         st.image(image, use_container_width=True)
         
@@ -166,7 +172,6 @@ else:
                 st.rerun()
         with col2:
             if st.button("不安 (保留)"):
-                # 保留分をメモリ内に保持（周回用）
                 st.session_state.retry_pages.append(st.session_state.current_pages.pop(0))
                 st.session_state.current_index += 1
                 save_progress()
@@ -174,7 +179,7 @@ else:
     else:
         st.balloons()
         st.success("この周回が終了しました！")
-        if st.button("最初からリセット"):
+        if st.button("進捗をリセットしてTOPへ"):
             doc_ref = get_progress_doc()
             if doc_ref:
                 doc_ref.delete()
